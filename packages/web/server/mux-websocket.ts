@@ -9,6 +9,7 @@
 import { WebSocketServer, WebSocket } from "ws";
 import { homedir, userInfo } from "node:os";
 import { spawn } from "node:child_process";
+import { recordActivityEvent } from "@aoagents/ao-core";
 import { findTmux, resolveTmuxSession, validateSessionId } from "./tmux-utils.js";
 
 // These types mirror src/lib/mux-protocol.ts exactly.
@@ -56,6 +57,9 @@ export class SessionBroadcaster {
   private errorSubscribers = new Set<(error: string) => void>();
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private polling = false;
+  // Tracks the last fetch outcome so we only emit ui.session_broadcast_failed on
+  // the healthy → failing transition (not every 3s during an outage).
+  private lastFetchOk = true;
   private readonly baseUrl: string;
 
   constructor(nextPort: string) {
@@ -151,16 +155,40 @@ export class SessionBroadcaster {
       if (!res.ok) {
         const msg = `Session fetch failed: HTTP ${res.status}`;
         console.warn(`[SessionBroadcaster] ${msg}`);
+        this.recordFetchFailure(msg, { httpStatus: res.status });
         return { sessions: null, error: msg };
       }
       const data = (await res.json()) as { sessions?: SessionPatch[] };
+      this.lastFetchOk = true;
       return { sessions: data.sessions ?? null, error: null };
     } catch (err) {
       clearTimeout(timeoutId);
       const msg = err instanceof Error ? err.message : String(err);
       console.warn("[SessionBroadcaster] fetchSnapshot error:", msg);
+      this.recordFetchFailure(msg);
       return { sessions: null, error: msg };
     }
+  }
+
+  /**
+   * Emit ui.session_broadcast_failed once per healthy→failing transition.
+   * The broadcaster polls every 3s; emitting on every failure during a long
+   * outage would flood the events table (~20/min). Recovery resets the flag.
+   */
+  private recordFetchFailure(message: string, extra?: Record<string, unknown>): void {
+    if (!this.lastFetchOk) return;
+    this.lastFetchOk = false;
+    recordActivityEvent({
+      source: "ui",
+      kind: "ui.session_broadcast_failed",
+      level: "warn",
+      summary: `session broadcaster fetch failed: ${message}`,
+      data: {
+        url: `${this.baseUrl}/api/sessions/patches`,
+        errorMessage: message,
+        ...extra,
+      },
+    });
   }
 
   private disconnect(): void {
@@ -323,6 +351,7 @@ class TerminalManager {
     pty.onExit(({ exitCode }) => {
       console.log(`[MuxServer] PTY exited for ${id} with code ${exitCode}`);
       terminal.pty = null;
+      let reattachError: string | undefined;
 
       // Re-attach if subscribers are still present, up to MAX_REATTACH_ATTEMPTS.
       // The cap prevents an unbounded respawn loop when the PTY crashes immediately
@@ -337,10 +366,35 @@ class TerminalManager {
           terminal.reattachAttempts = 0; // reset on successful attach
           return; // re-attached — don't notify exit
         } catch (err) {
+          reattachError = err instanceof Error ? err.message : String(err);
           console.error(`[MuxServer] Failed to re-attach ${id}:`, err);
         }
       } else if (terminal.reattachAttempts >= MAX_REATTACH_ATTEMPTS) {
         console.error(`[MuxServer] Max re-attach attempts reached for ${id}, giving up`);
+      }
+
+      // PTY actually died (vs user closed browser): only emit when subscribers
+      // are still attached — otherwise the exit is just normal cleanup.
+      if (terminal.subscribers.size > 0) {
+        recordActivityEvent({
+          projectId,
+          sessionId: id,
+          source: "ui",
+          kind: "ui.terminal_pty_lost",
+          level: "warn",
+          summary: `terminal PTY exited (code ${exitCode})${
+            terminal.reattachAttempts >= MAX_REATTACH_ATTEMPTS ? " — reattach exhausted" : ""
+          }`,
+          data: {
+            sessionId: id,
+            exitCode,
+            reattachAttempts: terminal.reattachAttempts,
+            maxReattachAttempts: MAX_REATTACH_ATTEMPTS,
+            reattachExhausted: terminal.reattachAttempts >= MAX_REATTACH_ATTEMPTS,
+            subscriberCount: terminal.subscribers.size,
+            ...(reattachError ? { reattachError } : {}),
+          },
+        });
       }
 
       // Notify subscribers that the terminal has exited (re-attach failed or no subscribers)
@@ -437,12 +491,30 @@ export function createMuxWebSocket(tmuxPath?: string): WebSocketServer | null {
 
   const wss = new WebSocketServer({ noServer: true });
 
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, request) => {
     console.log("[MuxServer] New mux connection");
+
+    const connectedAt = Date.now();
+    // Best-effort remote addr — proxy headers if present, else socket peer.
+    const xff = request?.headers["x-forwarded-for"];
+    const xffStr = Array.isArray(xff) ? xff[0] : xff;
+    const remoteAddr =
+      (typeof xffStr === "string" ? xffStr.split(",")[0]?.trim() : undefined) ??
+      request?.socket?.remoteAddress ??
+      undefined;
+
+    recordActivityEvent({
+      source: "ui",
+      kind: "ui.terminal_connected",
+      level: "info",
+      summary: "mux WebSocket connection opened",
+      data: { remoteAddr },
+    });
 
     const subscriptions = new Map<string, () => void>();
     let sessionUnsubscribe: (() => void) | null = null;
     let missedPongs = 0;
+    let heartbeatLostEmitted = false;
     const MAX_MISSED_PONGS = 3;
 
     // Heartbeat: send native WebSocket ping every 15s.
@@ -455,6 +527,22 @@ export function createMuxWebSocket(tmuxPath?: string): WebSocketServer | null {
         missedPongs += 1;
         if (missedPongs >= MAX_MISSED_PONGS) {
           console.log("[MuxServer] Too many missed pongs, terminating connection");
+          if (!heartbeatLostEmitted) {
+            heartbeatLostEmitted = true;
+            recordActivityEvent({
+              source: "ui",
+              kind: "ui.terminal_heartbeat_lost",
+              level: "warn",
+              summary: `mux WebSocket heartbeat lost (${missedPongs} missed pongs)`,
+              data: {
+                missedPongs,
+                maxMissedPongs: MAX_MISSED_PONGS,
+                connectionAgeMs: Date.now() - connectedAt,
+                remoteAddr,
+                subscriberCount: subscriptions.size,
+              },
+            });
+          }
           ws.terminate();
         }
       }
@@ -589,6 +677,17 @@ export function createMuxWebSocket(tmuxPath?: string): WebSocketServer | null {
         }
       } catch (err) {
         console.error("[MuxServer] Failed to parse message:", err);
+        recordActivityEvent({
+          source: "ui",
+          kind: "ui.terminal_protocol_error",
+          level: "warn",
+          summary: "invalid mux client message — parse failed",
+          data: {
+            errorMessage: err instanceof Error ? err.message : String(err),
+            remoteAddr,
+            subscriberCount: subscriptions.size,
+          },
+        });
         const errorMsg: ServerMessage = {
           ch: "system",
           type: "error",
@@ -603,8 +702,22 @@ export function createMuxWebSocket(tmuxPath?: string): WebSocketServer | null {
     /**
      * Handle connection close
      */
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
       console.log("[MuxServer] Mux connection closed");
+      recordActivityEvent({
+        source: "ui",
+        kind: "ui.terminal_disconnected",
+        level: "info",
+        summary: "mux WebSocket connection closed",
+        data: {
+          code,
+          reason: reason?.toString("utf8") || undefined,
+          connectionAgeMs: Date.now() - connectedAt,
+          subscriberCount: subscriptions.size,
+          heartbeatLost: heartbeatLostEmitted,
+          remoteAddr,
+        },
+      });
       clearInterval(heartbeatInterval);
       sessionUnsubscribe?.();
       sessionUnsubscribe = null;
