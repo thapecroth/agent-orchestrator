@@ -12,7 +12,14 @@
 import { getDb } from "./events-db.js";
 
 // Distinct names to avoid collision with types.ts EventType / EventSource.
-export type ActivityEventSource = "lifecycle" | "session-manager" | "api" | "ui";
+export type ActivityEventSource =
+  | "lifecycle"
+  | "session-manager"
+  | "api"
+  | "ui"
+  | "config"
+  | "plugin-registry"
+  | "migration";
 
 export type ActivityEventKind =
   | "session.spawn_started"
@@ -22,7 +29,21 @@ export type ActivityEventKind =
   | "activity.transition"
   | "lifecycle.transition"
   | "ci.failing"
-  | "review.pending";
+  | "review.pending"
+  | "config.project_resolve_failed"
+  | "config.project_malformed"
+  | "config.project_invalid"
+  | "config.migrated"
+  | "plugin-registry.load_failed"
+  | "plugin-registry.validation_failed"
+  | "plugin-registry.specifier_failed"
+  | "migration.blocked"
+  | "migration.project_failed"
+  | "migration.rename_failed"
+  | "migration.completed"
+  | "migration.rollback_skipped"
+  | "api.agent_report.transition_rejected"
+  | "api.agent_report.apply_failed";
 
 export type ActivityEventLevel = "debug" | "info" | "warn" | "error";
 

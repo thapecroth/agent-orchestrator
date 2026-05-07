@@ -31,6 +31,7 @@ import { buildLifecycleMetadataPatch, cloneLifecycle, deriveLegacyStatus, parseC
 import { parsePrFromUrl } from "./utils/pr.js";
 import { assertValidSessionIdComponent } from "./utils/session-id.js";
 import { validateStatus } from "./utils/validation.js";
+import { recordActivityEvent } from "./activity-events.js";
 
 /**
  * Canonical set of states an agent can self-declare.
@@ -453,6 +454,21 @@ export function applyAgentReport(
         before,
         after: before,
       });
+      recordActivityEvent({
+        sessionId,
+        source: "api",
+        kind: "api.agent_report.transition_rejected",
+        level: "warn",
+        summary: `agent report ${input.state} rejected: ${validation.reason ?? "transition rejected"}`,
+        data: {
+          reportState: input.state,
+          reason: validation.reason ?? "transition rejected",
+          previousSessionState: current.session.state,
+          previousLegacyStatus,
+          actor,
+          source,
+        },
+      });
       throw new Error(validation.reason ?? "transition rejected");
     }
     const mapped = mapAgentReportToLifecycle(input.state);
@@ -515,6 +531,18 @@ export function applyAgentReport(
   });
 
   if (!nextMetadata || !before || !previousState || !nextState || !legacyStatus) {
+    recordActivityEvent({
+      sessionId,
+      source: "api",
+      kind: "api.agent_report.apply_failed",
+      level: "error",
+      summary: `failed to apply agent report ${input.state} for ${sessionId}`,
+      data: {
+        reportState: input.state,
+        actor,
+        source,
+      },
+    });
     throw new Error(`Failed to apply agent report for session ${sessionId}`);
   }
 

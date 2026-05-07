@@ -10,6 +10,7 @@ import { withFileLockSync } from "./file-lock.js";
 import { ProjectResolveError } from "./types.js";
 import { generateSessionPrefix } from "./paths.js";
 import { normalizeOriginUrl } from "./storage-key.js";
+import { recordActivityEvent } from "./activity-events.js";
 
 function globalConfigLockPath(configPath: string): string {
   return `${configPath}.lock`;
@@ -302,6 +303,12 @@ export function loadGlobalConfig(
   if (migrationSummary) {
     // eslint-disable-next-line no-console -- required migration visibility for stale shadow stripping
     console.info(migrationSummary);
+    recordActivityEvent({
+      source: "config",
+      kind: "config.migrated",
+      summary: "global config migrated",
+      data: { migrationSummary },
+    });
   }
 
   const config = GlobalConfigSchema.parse(parsed);
@@ -867,6 +874,32 @@ export function resolveProjectIdentity(
       ),
       ...identityFields,
     };
+  }
+
+  if (localConfigResult.kind === "malformed") {
+    recordActivityEvent({
+      projectId,
+      source: "config",
+      kind: "config.project_malformed",
+      level: "error",
+      summary: `local config for ${projectId} could not be parsed`,
+      data: {
+        path: localConfigResult.path,
+        error: localConfigResult.error,
+      },
+    });
+  } else if (localConfigResult.kind === "invalid") {
+    recordActivityEvent({
+      projectId,
+      source: "config",
+      kind: "config.project_invalid",
+      level: "error",
+      summary: `local config for ${projectId} failed validation`,
+      data: {
+        path: localConfigResult.path,
+        error: localConfigResult.error,
+      },
+    });
   }
 
   const resolveError =
