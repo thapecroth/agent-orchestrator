@@ -1,4 +1,5 @@
 import { type NextRequest } from "next/server";
+import { recordActivityEvent } from "@aoagents/ao-core";
 import { validateIdentifier, validateString, validateConfiguredProject } from "@/lib/validation";
 import { getServices } from "@/lib/services";
 import { sessionToDashboard } from "@/lib/serialize";
@@ -50,6 +51,14 @@ export async function POST(request: NextRequest) {
         reason: projectErr,
         data: { issueId: body.issueId },
       });
+      recordActivityEvent({
+        projectId,
+        source: "api",
+        kind: "api.session_spawn_rejected",
+        level: "warn",
+        summary: `session spawn rejected: ${projectErr}`,
+        data: { reason: "project_not_configured" },
+      });
       return jsonWithCorrelation({ error: projectErr }, { status: 404 }, correlationId);
     }
 
@@ -75,6 +84,17 @@ export async function POST(request: NextRequest) {
       sessionId: session.id,
       data: { issueId: session.issueId },
     });
+    recordActivityEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      source: "api",
+      kind: "api.session_spawn_requested",
+      summary: `session spawn requested for ${session.projectId}`,
+      data: {
+        issueId: session.issueId ?? undefined,
+        hasPrompt: Boolean(prompt),
+      },
+    });
 
     return jsonWithCorrelation(
       { session: sessionToDashboard(session) },
@@ -97,6 +117,14 @@ export async function POST(request: NextRequest) {
         data: { issueId: body.issueId },
       });
     }
+    recordActivityEvent({
+      projectId: typeof body.projectId === "string" ? body.projectId : undefined,
+      source: "api",
+      kind: "api.session_spawn_failed",
+      level: "error",
+      summary: `session spawn failed: ${err instanceof Error ? err.message : "unknown error"}`,
+      data: { reason: err instanceof Error ? err.message : "unknown error" },
+    });
     return jsonWithCorrelation(
       { error: err instanceof Error ? err.message : "Failed to spawn session" },
       { status: 500 },

@@ -1,5 +1,9 @@
 import { type NextRequest, NextResponse } from "next/server";
-import { generateOrchestratorPrompt, generateSessionPrefix } from "@aoagents/ao-core";
+import {
+  generateOrchestratorPrompt,
+  generateSessionPrefix,
+  recordActivityEvent,
+} from "@aoagents/ao-core";
 import { getServices } from "@/lib/services";
 import { validateIdentifier, validateConfiguredProject } from "@/lib/validation";
 import { mapSessionsToOrchestrators } from "@/lib/orchestrator-utils";
@@ -98,6 +102,14 @@ export async function POST(request: NextRequest) {
     const systemPrompt = generateOrchestratorPrompt({ config, projectId, project });
     const session = await sessionManager.spawnOrchestrator({ projectId, systemPrompt });
 
+    recordActivityEvent({
+      projectId,
+      sessionId: session.id,
+      source: "api",
+      kind: "api.orchestrator_spawn_requested",
+      summary: `orchestrator spawn requested for ${projectId}`,
+    });
+
     return NextResponse.json(
       {
         orchestrator: {
@@ -110,6 +122,15 @@ export async function POST(request: NextRequest) {
     );
   } catch (err) {
     const classified = classifySpawnError(body.projectId as string, err);
+    const reason = err instanceof Error ? err.message : "Failed to spawn orchestrator";
+    recordActivityEvent({
+      projectId: typeof body.projectId === "string" ? body.projectId : undefined,
+      source: "api",
+      kind: "api.orchestrator_spawn_failed",
+      level: classified.status === 409 ? "warn" : "error",
+      summary: `orchestrator spawn failed: ${reason}`,
+      data: { reason, statusCode: classified.status },
+    });
     return NextResponse.json(classified.payload, { status: classified.status });
   }
 }

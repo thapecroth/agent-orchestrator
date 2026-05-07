@@ -9,6 +9,7 @@ import {
   loadConfig,
   loadGlobalConfig,
   loadLocalProjectConfigDetailed,
+  recordActivityEvent,
   repairWrappedLocalProjectConfig,
   unregisterProject,
   writeLocalProjectConfig,
@@ -229,6 +230,16 @@ export async function PATCH(
     invalidatePortfolioServicesCache();
     revalidateProjectPaths(id);
 
+    // Record only changed *keys*, never values — config can contain tokens.
+    const changedKeys = Object.keys(body).filter((k) => !IDENTITY_FIELDS.has(k));
+    recordActivityEvent({
+      projectId: id,
+      source: "api",
+      kind: "api.project_updated",
+      summary: `project updated: ${id}`,
+      data: { changedKeys },
+    });
+
     return NextResponse.json({ ok: true });
   } catch (error) {
     return NextResponse.json(
@@ -249,8 +260,9 @@ export async function DELETE(
   _request: NextRequest,
   context: { params: Promise<{ id: string }> },
 ) {
+  let id: string | undefined;
   try {
-    const { id } = await context.params;
+    ({ id } = await context.params);
     const state = getProjectState(id);
     if (!state.globalEntry && !state.project && !state.degradedProject) {
       return NextResponse.json({ error: `Unknown project: ${id}` }, { status: 404 });
@@ -278,16 +290,30 @@ export async function DELETE(
     invalidatePortfolioServicesCache();
     revalidateProjectPaths(id);
 
+    recordActivityEvent({
+      projectId: id,
+      source: "api",
+      kind: "api.project_removed",
+      summary: `project removed: ${id}`,
+      data: { removedStorageDir: hadStorageDir },
+    });
+
     return NextResponse.json({
       ok: true,
       projectId: id,
       removedStorageDir: hadStorageDir,
     });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to delete project" },
-      { status: 500 },
-    );
+    const reason = error instanceof Error ? error.message : "Failed to delete project";
+    recordActivityEvent({
+      projectId: id,
+      source: "api",
+      kind: "api.project_remove_failed",
+      level: "error",
+      summary: `project remove failed: ${reason}`,
+      data: { reason },
+    });
+    return NextResponse.json({ error: reason }, { status: 500 });
   }
 }
 
@@ -316,6 +342,13 @@ export async function POST(
     repairWrappedLocalProjectConfig(id, state.degradedProject.path);
     invalidatePortfolioServicesCache();
     revalidateProjectPaths(id);
+
+    recordActivityEvent({
+      projectId: id,
+      source: "api",
+      kind: "api.project_repaired",
+      summary: `project repaired: ${id}`,
+    });
 
     return NextResponse.json({ ok: true, repaired: true, projectId: id });
   } catch (error) {

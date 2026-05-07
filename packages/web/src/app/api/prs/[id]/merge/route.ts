@@ -1,4 +1,5 @@
 import { type NextRequest } from "next/server";
+import { recordActivityEvent } from "@aoagents/ao-core";
 import { getServices, getSCM } from "@/lib/services";
 import { getCorrelationId, jsonWithCorrelation, recordApiObservation } from "@/lib/observability";
 
@@ -34,6 +35,15 @@ export async function POST(_request: NextRequest, { params }: { params: Promise<
     // Validate PR is in a mergeable state
     const state = await scm.getPRState(session.pr);
     if (state !== "open") {
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "api",
+        kind: "api.pr_merge_rejected",
+        level: "warn",
+        summary: `PR ${prNumber} merge rejected: state is ${state}`,
+        data: { prNumber, prState: state, statusCode: 409 },
+      });
       return jsonWithCorrelation(
         { error: `PR is ${state}, not open` },
         { status: 409 },
@@ -43,6 +53,15 @@ export async function POST(_request: NextRequest, { params }: { params: Promise<
 
     const mergeability = await scm.getMergeability(session.pr);
     if (!mergeability.mergeable) {
+      recordActivityEvent({
+        projectId: session.projectId,
+        sessionId: session.id,
+        source: "api",
+        kind: "api.pr_merge_rejected",
+        level: "warn",
+        summary: `PR ${prNumber} merge rejected: not mergeable`,
+        data: { prNumber, blockers: mergeability.blockers, statusCode: 422 },
+      });
       return jsonWithCorrelation(
         { error: "PR is not mergeable", blockers: mergeability.blockers },
         { status: 422 },
@@ -62,6 +81,14 @@ export async function POST(_request: NextRequest, { params }: { params: Promise<
       projectId: session.projectId,
       sessionId: session.id,
       data: { prNumber },
+    });
+    recordActivityEvent({
+      projectId: session.projectId,
+      sessionId: session.id,
+      source: "api",
+      kind: "api.pr_merge_requested",
+      summary: `PR ${prNumber} merge requested`,
+      data: { prNumber, method: "squash" },
     });
     return jsonWithCorrelation(
       { ok: true, prNumber, method: "squash" },
@@ -83,6 +110,14 @@ export async function POST(_request: NextRequest, { params }: { params: Promise<
         data: { prNumber },
       });
     }
+    const reason = err instanceof Error ? err.message : "Failed to merge PR";
+    recordActivityEvent({
+      source: "api",
+      kind: "api.pr_merge_failed",
+      level: "error",
+      summary: `PR ${prNumber} merge failed: ${reason}`,
+      data: { prNumber, reason },
+    });
     return jsonWithCorrelation(
       { error: err instanceof Error ? err.message : "Failed to merge PR" },
       { status: 500 },
