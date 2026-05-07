@@ -35,6 +35,7 @@ import { assertValidSessionIdComponent, SESSION_ID_COMPONENT_PATTERN } from "./u
 import { flattenToStringRecord } from "./utils/metadata-flatten.js";
 import { validateStatus } from "./utils/validation.js";
 import { withFileLockSync } from "./file-lock.js";
+import { recordActivityEvent } from "./activity-events.js";
 
 const JSON_EXTENSION = ".json";
 
@@ -356,8 +357,10 @@ export function mutateMetadata(
           // that anything was wrong — the file just becomes "not
           // corrupt anymore — and missing fields".
           const corruptPath = `${path}.corrupt-${Date.now()}`;
+          let renamed = false;
           try {
             renameSync(path, corruptPath);
+            renamed = true;
             // eslint-disable-next-line no-console
             console.warn(
               `[metadata] corrupt JSON at ${path}; preserved as ${corruptPath} before rewriting`,
@@ -365,6 +368,22 @@ export function mutateMetadata(
           } catch {
             // best effort — proceed even if the rename fails (e.g. EACCES)
           }
+          // Surface forensically — the original `console.warn` is invisible
+          // to anyone not tailing the orchestrator log. AE makes corrupt
+          // detection queryable.
+          recordActivityEvent({
+            sessionId,
+            source: "session-manager",
+            kind: "metadata.corrupt_detected",
+            level: "warn",
+            summary: `corrupt metadata JSON detected: ${sessionId}`,
+            data: {
+              path,
+              corruptPath: renamed ? corruptPath : null,
+              renamed,
+              bytes: content.length,
+            },
+          });
         }
       }
     } else if (!options.createIfMissing) {

@@ -1154,6 +1154,18 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           // Branch will be generated as feat/{issueId} (line 329-331)
         } else {
           // Other error (auth, network, etc) - fail fast
+          recordActivityEvent({
+            projectId: spawnConfig.projectId,
+            source: "session-manager",
+            kind: "tracker.issue_fetch_failed",
+            level: "error",
+            summary: `tracker getIssue failed for ${spawnConfig.issueId}`,
+            data: {
+              issueId: spawnConfig.issueId,
+              tracker: plugins.tracker.name,
+              reason: err instanceof Error ? err.message : String(err),
+            },
+          });
           throw new Error(`Failed to fetch issue ${spawnConfig.issueId}: ${err}`, { cause: err });
         }
       }
@@ -1228,9 +1240,23 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       if (spawnConfig.issueId && plugins.tracker && resolvedIssue) {
         try {
           issueContext = await plugins.tracker.generatePrompt(spawnConfig.issueId, project);
-        } catch {
-          // Non-fatal: continue without detailed issue context
-          // Silently ignore errors - caller can check if issueContext is undefined
+        } catch (err) {
+          // Non-fatal: continue without detailed issue context. Surface the
+          // failure via AE so RCA can answer "did the agent get an enriched
+          // prompt or just the bare issue ID?"
+          recordActivityEvent({
+            projectId: spawnConfig.projectId,
+            sessionId,
+            source: "session-manager",
+            kind: "tracker.generate_prompt_failed",
+            level: "warn",
+            summary: `tracker generatePrompt failed for ${spawnConfig.issueId}`,
+            data: {
+              issueId: spawnConfig.issueId,
+              tracker: plugins.tracker.name,
+              reason: err instanceof Error ? err.message : String(err),
+            },
+          });
         }
       }
 
@@ -1418,10 +1444,10 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // in interactive mode). Prompt delivery failure must NOT destroy the
       // session — the agent is running; user can retry with `ao send`.
       let promptDelivered = false;
+      let promptLastError: Error | undefined;
       if (plugins.agent.promptDelivery === "post-launch" && agentLaunchConfig.prompt) {
         const maxRetries = 3;
         const baseDelayMs = 3_000;
-        let lastError: Error | undefined;
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
           try {
@@ -1432,9 +1458,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
             promptDelivered = true;
             break;
           } catch (err) {
-            lastError = err instanceof Error ? err : new Error(String(err));
+            promptLastError = err instanceof Error ? err : new Error(String(err));
             console.error(
-              `[session-manager] Prompt delivery attempt ${attempt}/${maxRetries} failed: ${lastError.message}`,
+              `[session-manager] Prompt delivery attempt ${attempt}/${maxRetries} failed: ${promptLastError.message}`,
             );
           }
         }
@@ -1442,7 +1468,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         if (!promptDelivered) {
           console.error(
             `[session-manager] FAILED to deliver prompt to session ${sessionId} after ${maxRetries} attempts. ` +
-              `User must send manually with 'ao send'. Last error: ${lastError?.message}`,
+              `User must send manually with 'ao send'. Last error: ${promptLastError?.message}`,
           );
         }
 
@@ -1454,6 +1480,30 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       if (session.metadata["promptDelivered"]) {
         updateMetadata(sessionsDir, sessionId, session.metadata);
         invalidateCache();
+      }
+
+      // Emit failure-only AE after metadata has been persisted (B1) and only
+      // when all retries exhausted (B16). Prompt content is intentionally
+      // omitted from `data` because user prompts may include free-form text
+      // (B11 — see #1620 review).
+      if (
+        plugins.agent.promptDelivery === "post-launch" &&
+        agentLaunchConfig.prompt &&
+        !promptDelivered
+      ) {
+        recordActivityEvent({
+          projectId: spawnConfig.projectId,
+          sessionId,
+          source: "session-manager",
+          kind: "session.prompt_delivery_failed",
+          level: "error",
+          summary: `prompt delivery failed after 3 retries: ${sessionId}`,
+          data: {
+            attempts: 3,
+            agent: plugins.agent.name,
+            lastError: promptLastError?.message,
+          },
+        });
       }
 
       recordActivityEvent({
@@ -1470,14 +1520,59 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // Log cleanup failures so they don't disappear silently. The original
       // code used /* best effort */ swallows; the stack preserves that
       // behavior (cleanup errors don't propagate) but surfaces them for debug.
+      recordActivityEvent({
+        projectId: spawnConfig.projectId,
+        source: "session-manager",
+        kind: "session.rollback_started",
+        level: "warn",
+        summary: "spawn rollback started",
+        data: { reason: err instanceof Error ? err.message : String(err) },
+      });
       await cleanupStack.runAll((cleanupErr) => {
         console.error("[session-manager] spawn rollback step failed:", cleanupErr);
+        // B25: emit per-step rollback failure so each leaked resource is queryable.
+        recordActivityEvent({
+          projectId: spawnConfig.projectId,
+          source: "session-manager",
+          kind: "session.rollback_step_failed",
+          level: "error",
+          summary: "spawn rollback step failed",
+          data: {
+            reason: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+          },
+        });
       });
       throw err;
     }
   }
 
   async function spawnOrchestrator(orchestratorConfig: OrchestratorSpawnConfig): Promise<Session> {
+    recordActivityEvent({
+      projectId: orchestratorConfig.projectId,
+      source: "session-manager",
+      kind: "session.spawn_started",
+      summary: "orchestrator spawn started",
+      data: { agent: orchestratorConfig.agent ?? undefined, role: "orchestrator" },
+    });
+    try {
+      return await _spawnOrchestratorInner(orchestratorConfig);
+    } catch (err) {
+      recordActivityEvent({
+        projectId: orchestratorConfig.projectId,
+        source: "session-manager",
+        kind: "session.spawn_failed",
+        level: "error",
+        summary: "orchestrator spawn failed",
+        data: {
+          role: "orchestrator",
+          reason: err instanceof Error ? err.message : String(err),
+        },
+      });
+      throw err;
+    }
+  }
+
+  async function _spawnOrchestratorInner(orchestratorConfig: OrchestratorSpawnConfig): Promise<Session> {
     const project = config.projects[orchestratorConfig.projectId];
     if (!project) {
       throw new Error(`Unknown project: ${orchestratorConfig.projectId}`);
@@ -1538,6 +1633,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       workspacePath = wsInfo.path;
       adoptedManagedWorkspace = adoptedInfo !== undefined && adoptedInfo !== null;
     } catch (err) {
+      recordActivityEvent({
+        projectId: orchestratorConfig.projectId,
+        sessionId,
+        source: "session-manager",
+        kind: "session.spawn_failed",
+        level: "error",
+        summary: "orchestrator workspace.create failed",
+        data: {
+          role: "orchestrator",
+          stage: "workspace_create",
+          reason: err instanceof Error ? err.message : String(err),
+        },
+      });
       try {
         deleteMetadata(sessionsDir, sessionId);
       } catch {
@@ -1583,6 +1691,21 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         await setupPathWrapperWorkspace(workspacePath);
       }
     } catch (err) {
+      // PR tracking and CI fetch hooks are wired here — emit a dedicated AE
+      // before rolling back so RCA can answer "did the orchestrator launch
+      // succeed but lose its hook integration?".
+      recordActivityEvent({
+        projectId: orchestratorConfig.projectId,
+        sessionId,
+        source: "session-manager",
+        kind: "session.workspace_hooks_failed",
+        level: "error",
+        summary: "orchestrator workspace hooks installation failed",
+        data: {
+          agent: plugins.agent.name,
+          reason: err instanceof Error ? err.message : String(err),
+        },
+      });
       await cleanupWorktreeAndMetadata();
       throw err;
     }
@@ -1598,6 +1721,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         systemPromptFile = join(projectDir, `orchestrator-prompt-${sessionId}.md`);
         writeFileSync(systemPromptFile, orchestratorConfig.systemPrompt, "utf-8");
       } catch (err) {
+        recordActivityEvent({
+          projectId: orchestratorConfig.projectId,
+          sessionId,
+          source: "session-manager",
+          kind: "session.spawn_failed",
+          level: "error",
+          summary: "orchestrator systemPrompt write failed",
+          data: {
+            role: "orchestrator",
+            stage: "system_prompt_write",
+            reason: err instanceof Error ? err.message : String(err),
+          },
+        });
         await cleanupWorktreeAndMetadata(systemPromptFile);
         throw err;
       }
@@ -1607,6 +1743,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       try {
         writeWorkspaceOpenCodeAgentsMd(workspacePath, systemPromptFile);
       } catch (err) {
+        recordActivityEvent({
+          projectId: orchestratorConfig.projectId,
+          sessionId,
+          source: "session-manager",
+          kind: "session.spawn_failed",
+          level: "error",
+          summary: "orchestrator AGENTS.md write failed",
+          data: {
+            role: "orchestrator",
+            stage: "agents_md_write",
+            reason: err instanceof Error ? err.message : String(err),
+          },
+        });
         await cleanupWorktreeAndMetadata(systemPromptFile);
         throw err;
       }
@@ -1631,6 +1780,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         });
       }
     } catch (err) {
+      recordActivityEvent({
+        projectId: orchestratorConfig.projectId,
+        sessionId,
+        source: "session-manager",
+        kind: "session.spawn_failed",
+        level: "error",
+        summary: "orchestrator opencode session resolution failed",
+        data: {
+          role: "orchestrator",
+          stage: "opencode_session_reuse",
+          reason: err instanceof Error ? err.message : String(err),
+        },
+      });
       await cleanupWorktreeAndMetadata(systemPromptFile);
       throw err;
     }
@@ -1686,6 +1848,22 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         },
       });
     } catch (err) {
+      // Outer envelope catches and emits session.spawn_failed; this inner emit
+      // tags the runtime.create failure path specifically so RCA can answer
+      // "did the orchestrator runtime fail to start at all?".
+      recordActivityEvent({
+        projectId: orchestratorConfig.projectId,
+        sessionId,
+        source: "session-manager",
+        kind: "session.spawn_failed",
+        level: "error",
+        summary: "orchestrator runtime.create failed",
+        data: {
+          role: "orchestrator",
+          stage: "runtime_create",
+          reason: err instanceof Error ? err.message : String(err),
+        },
+      });
       await cleanupWorktreeAndMetadata(systemPromptFile);
       throw err;
     }
@@ -1773,6 +1951,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       }
       invalidateCache();
     } catch (err) {
+      recordActivityEvent({
+        projectId: orchestratorConfig.projectId,
+        sessionId,
+        source: "session-manager",
+        kind: "session.spawn_failed",
+        level: "error",
+        summary: "orchestrator post-launch metadata write failed",
+        data: {
+          role: "orchestrator",
+          stage: "post_launch_metadata",
+          reason: err instanceof Error ? err.message : String(err),
+        },
+      });
       // Clean up runtime on post-launch failure
       try {
         await plugins.runtime.destroy(handle);
@@ -1842,6 +2033,16 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       if (!isFixedOrchestratorReservationError(err, sessionId)) {
         throw err;
       }
+
+      recordActivityEvent({
+        projectId: orchestratorConfig.projectId,
+        sessionId,
+        source: "session-manager",
+        kind: "session.orchestrator_conflict",
+        level: "warn",
+        summary: "concurrent orchestrator reservation conflict",
+        data: { reason: err instanceof Error ? err.message : String(err) },
+      });
 
       const concurrent = await waitForConcurrentOrchestrator(sessionId);
       if (concurrent) return concurrent;
@@ -1942,21 +2143,45 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         session.lifecycle.session.state !== "terminated" &&
         session.lifecycle.session.state !== "done"
       ) {
+        const runtimeStateBefore = session.lifecycle.runtime.state;
+        const runtimeReasonBefore = session.lifecycle.runtime.reason;
         try {
           const persisted = buildUpdatedLifecycle(sessionName, raw, (next) => {
             next.session.state = "terminated";
             next.session.reason = "runtime_lost";
             next.session.terminatedAt = new Date().toISOString();
             next.session.lastTransitionAt = next.session.terminatedAt;
-            next.runtime.state = session.lifecycle!.runtime.state;
-            next.runtime.reason = session.lifecycle!.runtime.reason;
+            next.runtime.state = runtimeStateBefore;
+            next.runtime.reason = runtimeReasonBefore;
             next.runtime.lastObservedAt = new Date().toISOString();
           });
+          // B1: persist BEFORE emitting the event
           updateMetadata(sessionsDir, sessionName, lifecycleMetadataUpdates(raw, persisted));
           session.lifecycle = persisted;
           session.status = deriveLegacyStatus(persisted);
-        } catch {
+          recordActivityEvent({
+            projectId: sessionProjectId,
+            sessionId: sessionName,
+            source: "session-manager",
+            kind: "runtime.lost_detected",
+            level: "warn",
+            summary: `runtime lost reconciled: ${sessionName}`,
+            data: {
+              runtimeState: runtimeStateBefore,
+              runtimeReason: runtimeReasonBefore,
+            },
+          });
+        } catch (err) {
           // Persist failed — in-memory state is still correct for this request
+          recordActivityEvent({
+            projectId: sessionProjectId,
+            sessionId: sessionName,
+            source: "session-manager",
+            kind: "runtime.lost_persist_failed",
+            level: "error",
+            summary: `runtime_lost persist failed: ${sessionName}`,
+            data: { reason: err instanceof Error ? err.message : String(err) },
+          });
         }
       }
 
@@ -2066,6 +2291,17 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     const killReason: LifecycleKillReason = options?.reason ?? "manually_killed";
     const cleanupAgent = resolveSelectionForSession(project, sessionId, raw).agentName;
 
+    // Emit kill_started up-front — this is the only signal that the kill
+    // intent reached the manager (the destroys below are silent on failure).
+    recordActivityEvent({
+      projectId,
+      sessionId,
+      source: "session-manager",
+      kind: "session.kill_started",
+      summary: `kill started: ${sessionId}`,
+      data: { reason: killReason },
+    });
+
     // Destroy runtime — prefer handle.runtimeName to find the correct plugin
     if (raw["runtimeHandle"]) {
       const handle = safeJsonParse<RuntimeHandle>(raw["runtimeHandle"]);
@@ -2078,8 +2314,20 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         if (runtimePlugin) {
           try {
             await runtimePlugin.destroy(handle);
-          } catch {
-            // Runtime might already be gone
+          } catch (err) {
+            // Runtime might already be gone — surface as AE so leaks are queryable.
+            recordActivityEvent({
+              projectId,
+              sessionId,
+              source: "session-manager",
+              kind: "runtime.destroy_failed",
+              level: "warn",
+              summary: `runtime.destroy failed during kill: ${sessionId}`,
+              data: {
+                runtime: handle.runtimeName ?? null,
+                reason: err instanceof Error ? err.message : String(err),
+              },
+            });
           }
         }
       }
@@ -2093,8 +2341,21 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       if (workspacePlugin) {
         try {
           await workspacePlugin.destroy(worktree);
-        } catch {
-          // Workspace might already be gone
+        } catch (err) {
+          // Workspace might already be gone — emit AE so abandoned worktrees
+          // surface for cleanup tooling.
+          recordActivityEvent({
+            projectId,
+            sessionId,
+            source: "session-manager",
+            kind: "workspace.destroy_failed",
+            level: "warn",
+            summary: `workspace.destroy failed during kill: ${sessionId}`,
+            data: {
+              workspace: workspacePlugin.name,
+              reason: err instanceof Error ? err.message : String(err),
+            },
+          });
         }
       }
     }
@@ -2112,8 +2373,20 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         try {
           await deleteOpenCodeSession(mappedOpenCodeSessionId);
           didPurgeOpenCodeSession = true;
-        } catch {
-          void 0;
+        } catch (err) {
+          // Dangling opencode session is a real leak — surface for RCA.
+          recordActivityEvent({
+            projectId,
+            sessionId,
+            source: "session-manager",
+            kind: "agent.opencode_purge_failed",
+            level: "warn",
+            summary: `opencode session purge failed: ${sessionId}`,
+            data: {
+              opencodeSessionId: mappedOpenCodeSessionId,
+              reason: err instanceof Error ? err.message : String(err),
+            },
+          });
         }
       }
     }
@@ -2246,9 +2519,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           pushSkipped(session.projectId, session.id);
         }
       } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
         result.errors.push({
           sessionId: session.id,
-          error: err instanceof Error ? err.message : String(err),
+          error: errorMessage,
+        });
+        recordActivityEvent({
+          projectId: session.projectId,
+          sessionId: session.id,
+          source: "session-manager",
+          kind: "session.cleanup_error",
+          level: "warn",
+          summary: `cleanup error: ${session.id}`,
+          data: { reason: errorMessage },
         });
       }
     }
@@ -2292,9 +2575,22 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
                 opencodeCleanedAt: new Date().toISOString(),
               }));
             } catch (err) {
+              const errorMessage = err instanceof Error ? err.message : String(err);
               result.errors.push({
                 sessionId: terminatedId,
-                error: `Failed to delete OpenCode session ${mappedOpenCodeSessionId}: ${err instanceof Error ? err.message : String(err)}`,
+                error: `Failed to delete OpenCode session ${mappedOpenCodeSessionId}: ${errorMessage}`,
+              });
+              recordActivityEvent({
+                projectId: projectKey,
+                sessionId: terminatedId,
+                source: "session-manager",
+                kind: "agent.opencode_purge_failed",
+                level: "warn",
+                summary: `opencode session purge failed during cleanup: ${terminatedId}`,
+                data: {
+                  opencodeSessionId: mappedOpenCodeSessionId,
+                  reason: errorMessage,
+                },
               });
               continue;
             }
@@ -2325,7 +2621,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
   }
 
   async function send(sessionId: SessionId, message: string): Promise<void> {
-    const { raw, sessionsDir, project } = requireSessionRecord(sessionId);
+    const { raw, sessionsDir, project, projectId } = requireSessionRecord(sessionId);
 
     const selection = resolveSelectionForSession(project, sessionId, raw);
     const selectedAgent = selection.agentName;
@@ -2486,6 +2782,15 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         return restored;
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
+        recordActivityEvent({
+          projectId,
+          sessionId,
+          source: "session-manager",
+          kind: "session.restore_failed",
+          level: "error",
+          summary: `restore for delivery failed: ${sessionId}`,
+          data: { reason: detail, trigger: "send" },
+        });
         throw new Error(`Cannot send to session ${sessionId}: ${reason} (${detail})`, {
           cause: err,
         });
@@ -2581,30 +2886,52 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       return;
     };
 
-    let prepared = await prepareSession();
-
+    // Top-level try/catch: any final send failure (initial preparation,
+    // retry-with-restore, etc.) emits a single `session.send_failed` event
+    // (B16 — failure-only). Stage tag distinguishes which branch failed.
+    let stage: "prepare" | "initial" | "restore_retry" = "prepare";
     try {
-      await sendWithConfirmation(prepared);
-    } catch (err) {
-      const shouldRetryWithRestore =
-        prepared.restoredAt === undefined && isRestorable(prepared);
+      let prepared = await prepareSession();
 
-      if (!shouldRetryWithRestore) {
-        if (err instanceof Error) {
-          throw err;
-        }
-        throw new Error(String(err), { cause: err });
-      }
-
-      prepared = await prepareSession(true);
       try {
+        stage = "initial";
         await sendWithConfirmation(prepared);
-      } catch (retryErr) {
-        if (retryErr instanceof Error) {
-          throw retryErr;
+      } catch (err) {
+        const shouldRetryWithRestore =
+          prepared.restoredAt === undefined && isRestorable(prepared);
+
+        if (!shouldRetryWithRestore) {
+          if (err instanceof Error) {
+            throw err;
+          }
+          throw new Error(String(err), { cause: err });
         }
-        throw new Error(String(retryErr), { cause: retryErr });
+
+        prepared = await prepareSession(true);
+        try {
+          stage = "restore_retry";
+          await sendWithConfirmation(prepared);
+        } catch (retryErr) {
+          if (retryErr instanceof Error) {
+            throw retryErr;
+          }
+          throw new Error(String(retryErr), { cause: retryErr });
+        }
       }
+    } catch (err) {
+      recordActivityEvent({
+        projectId,
+        sessionId,
+        source: "session-manager",
+        kind: "session.send_failed",
+        level: "error",
+        summary: `send failed: ${sessionId}`,
+        data: {
+          stage,
+          reason: err instanceof Error ? err.message : String(err),
+        },
+      });
+      throw err;
     }
   }
 
@@ -2796,6 +3123,20 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       const reason = NON_RESTORABLE_STATUSES.has(session.status)
         ? `status "${session.status}" is not restorable`
         : `session is not in a terminal state (status: "${session.status}", activity: "${session.activity}")`;
+      recordActivityEvent({
+        projectId,
+        sessionId,
+        source: "session-manager",
+        kind: "session.restore_failed",
+        level: "error",
+        summary: `restore not allowed: ${sessionId}`,
+        data: {
+          stage: "validation",
+          status: session.status,
+          activity: session.activity,
+          reason,
+        },
+      });
       throw new SessionNotRestorableError(sessionId, reason);
     }
 
@@ -2838,6 +3179,19 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           await plugins.workspace.postCreate(wsInfo, project);
         }
       } catch (err) {
+        recordActivityEvent({
+          projectId,
+          sessionId,
+          source: "session-manager",
+          kind: "session.restore_failed",
+          level: "error",
+          summary: `workspace restore failed: ${sessionId}`,
+          data: {
+            stage: "workspace_restore",
+            workspacePath,
+            reason: err instanceof Error ? err.message : String(err),
+          },
+        });
         throw new WorkspaceMissingError(
           workspacePath,
           `restore failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -2911,8 +3265,31 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
           restoreFallbackReason: reason,
         });
         if (requiresNativeRestore(plugins.agent.name)) {
+          recordActivityEvent({
+            projectId,
+            sessionId,
+            source: "session-manager",
+            kind: "session.restore_failed",
+            level: "error",
+            summary: `native restore required but unavailable: ${sessionId}`,
+            data: {
+              stage: "native_restore_required",
+              agent: plugins.agent.name,
+              reason,
+            },
+          });
           throw new SessionNotRestorableError(sessionId, reason);
         }
+        // Surface that AO fell back to a fresh launch instead of native restore.
+        recordActivityEvent({
+          projectId,
+          sessionId,
+          source: "session-manager",
+          kind: "session.restore_fallback",
+          level: "warn",
+          summary: `using fresh launch instead of native restore: ${sessionId}`,
+          data: { agent: plugins.agent.name, reason },
+        });
         launchCommand = plugins.agent.getLaunchCommand(agentLaunchConfig);
       }
     } else {
