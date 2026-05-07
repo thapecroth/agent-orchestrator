@@ -12,7 +12,7 @@
 import { getDb } from "./events-db.js";
 
 // Distinct names to avoid collision with types.ts EventType / EventSource.
-export type ActivityEventSource = "lifecycle" | "session-manager" | "api" | "ui";
+export type ActivityEventSource = "lifecycle" | "session-manager" | "api" | "ui" | "cli";
 
 export type ActivityEventKind =
   | "session.spawn_started"

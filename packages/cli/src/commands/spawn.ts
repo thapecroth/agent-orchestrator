@@ -4,6 +4,7 @@ import type { Command } from "commander";
 import { resolve } from "node:path";
 import {
   loadConfig,
+  recordActivityEvent,
   resolveSpawnTarget,
   TERMINAL_STATUSES,
   type OrchestratorConfig,
@@ -216,6 +217,20 @@ async function spawnSession(
       throw new Error("Prompt must be at most 4096 characters");
     }
 
+    recordActivityEvent({
+      projectId,
+      source: "cli",
+      kind: "cli.spawn_invoked",
+      level: "info",
+      summary: `ao spawn invoked${issueId ? ` for issue ${issueId}` : ""}`,
+      data: {
+        issueId: issueId ?? null,
+        agent: agent ?? null,
+        hasPrompt: !!sanitizedPrompt,
+        claimPr: claimOptions?.claimPr ?? null,
+      },
+    });
+
     const session = await sm.spawn({
       projectId,
       issueId,
@@ -273,6 +288,18 @@ async function spawnSession(
     console.log(`SESSION=${session.id}`);
   } catch (err) {
     spinner.fail("Failed to create or initialize session");
+    recordActivityEvent({
+      projectId,
+      source: "cli",
+      kind: "cli.spawn_failed",
+      level: "error",
+      summary: `ao spawn failed${issueId ? ` for issue ${issueId}` : ""}`,
+      data: {
+        issueId: issueId ?? null,
+        agent: agent ?? null,
+        errorMessage: err instanceof Error ? err.message : String(err),
+      },
+    });
     throw err;
   }
 }
@@ -415,6 +442,17 @@ export function registerBatchSpawn(program: Command): void {
           await runSpawnPreflight(config, groupProjectId);
           await warnIfAONotRunning(groupProjectId);
         } catch (err) {
+          recordActivityEvent({
+            projectId: groupProjectId,
+            source: "cli",
+            kind: "cli.spawn_failed",
+            level: "error",
+            summary: `batch-spawn preflight failed for group`,
+            data: {
+              batchSize: items.length,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            },
+          });
           console.error(chalk.red(`✗ ${err instanceof Error ? err.message : String(err)}`));
           process.exit(1);
         }

@@ -1,6 +1,6 @@
 import type { Command } from "commander";
 import chalk from "chalk";
-import { migrateStorage, rollbackStorage } from "@aoagents/ao-core";
+import { migrateStorage, recordActivityEvent, rollbackStorage } from "@aoagents/ao-core";
 
 export function registerMigrateStorage(program: Command): void {
   program
@@ -19,6 +19,13 @@ export function registerMigrateStorage(program: Command): void {
               dryRun: opts.dryRun,
               log: (msg) => console.log(msg),
             });
+            recordActivityEvent({
+              source: "cli",
+              kind: "cli.migration_completed",
+              level: "info",
+              summary: `storage rollback completed`,
+              data: { rollback: true, dryRun: opts.dryRun === true },
+            });
           } else {
             const result = await migrateStorage({
               dryRun: opts.dryRun,
@@ -31,8 +38,30 @@ export function registerMigrateStorage(program: Command): void {
             } else {
               console.log(chalk.green("\nMigration complete."));
             }
+            recordActivityEvent({
+              source: "cli",
+              kind: "cli.migration_completed",
+              level: "info",
+              summary: `storage migration completed (${result.projects} project(s))`,
+              data: {
+                rollback: false,
+                dryRun: opts.dryRun === true,
+                force: opts.force === true,
+                projects: result.projects,
+              },
+            });
           }
         } catch (err) {
+          recordActivityEvent({
+            source: "cli",
+            kind: "cli.migration_failed",
+            level: "error",
+            summary: `storage migration failed`,
+            data: {
+              rollback: opts.rollback === true,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            },
+          });
           console.error(
             chalk.red(err instanceof Error ? err.message : String(err)),
           );

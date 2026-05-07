@@ -31,6 +31,7 @@ vi.mock("@aoagents/ao-core", () => ({
   findConfigFile: (...args: unknown[]) => mockFindConfigFile(...args),
   isCanonicalGlobalConfigPath: (configPath: string | undefined) =>
     configPath === join(homedir(), ".agent-orchestrator", "config.yaml"),
+  recordActivityEvent: vi.fn(),
 }));
 
 vi.mock("node:fs", async (importOriginal) => {

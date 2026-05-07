@@ -12,7 +12,7 @@
  * see ao-118 plan PR B).
  */
 
-import { isTerminalSession, loadConfig } from "@aoagents/ao-core";
+import { isTerminalSession, loadConfig, recordActivityEvent } from "@aoagents/ao-core";
 import { stopBunTmpJanitor } from "./bun-tmp-janitor.js";
 import { getSessionManager } from "./create-session-manager.js";
 import { stopAllLifecycleWorkers } from "./lifecycle-service.js";
@@ -52,6 +52,15 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
 
     const exitCode = signal === "SIGINT" ? 130 : 0;
 
+    recordActivityEvent({
+      projectId: ctx.projectId,
+      source: "cli",
+      kind: "cli.shutdown_signal",
+      level: "info",
+      summary: `received ${signal}, beginning graceful shutdown`,
+      data: { signal, exitCode },
+    });
+
     try {
       stopProjectSupervisor();
       stopAllLifecycleWorkers();
@@ -59,7 +68,17 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
       // Best-effort — never block shutdown on observability.
     }
 
-    const forceExit = setTimeout(() => process.exit(exitCode), SHUTDOWN_TIMEOUT_MS);
+    const forceExit = setTimeout(() => {
+      recordActivityEvent({
+        projectId: ctx.projectId,
+        source: "cli",
+        kind: "cli.shutdown_force_exit",
+        level: "warn",
+        summary: `force-exit after ${SHUTDOWN_TIMEOUT_MS}ms timeout`,
+        data: { signal, timeoutMs: SHUTDOWN_TIMEOUT_MS, exitCode },
+      });
+      process.exit(exitCode);
+    }, SHUTDOWN_TIMEOUT_MS);
     forceExit.unref();
 
     void (async () => {
@@ -76,8 +95,16 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
             if (result.cleaned || result.alreadyTerminated) {
               killedSessionIds.push(session.id);
             }
-          } catch {
-            // Best-effort per session
+          } catch (err) {
+            recordActivityEvent({
+              projectId: session.projectId ?? ctx.projectId,
+              sessionId: session.id,
+              source: "cli",
+              kind: "cli.shutdown_session_kill_failed",
+              level: "warn",
+              summary: `failed to kill session during shutdown`,
+              data: { errorMessage: err instanceof Error ? err.message : String(err) },
+            });
           }
         }
 
@@ -106,8 +133,23 @@ export function installShutdownHandlers(ctx: ShutdownContext): void {
         }
 
         await unregister();
-      } catch {
-        // Best-effort — always exit even if cleanup fails
+        recordActivityEvent({
+          projectId: ctx.projectId,
+          source: "cli",
+          kind: "cli.shutdown_completed",
+          level: "info",
+          summary: `clean shutdown completed`,
+          data: { signal, killedSessionCount: killedSessionIds.length, exitCode },
+        });
+      } catch (err) {
+        recordActivityEvent({
+          projectId: ctx.projectId,
+          source: "cli",
+          kind: "cli.shutdown_failed",
+          level: "error",
+          summary: `shutdown body threw before cleanup completed`,
+          data: { signal, errorMessage: err instanceof Error ? err.message : String(err) },
+        });
       }
       try {
         // Await any in-flight sweep so shutdown does not exit while
