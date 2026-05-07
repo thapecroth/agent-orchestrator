@@ -9,6 +9,7 @@ import {
   type OrchestratorEvent,
   type PluginModule,
   getObservabilityBaseDir,
+  recordActivityEvent,
 } from "@aoagents/ao-core";
 import { isRetryableHttpStatus, normalizeRetryConfig, validateUrl } from "@aoagents/ao-core/utils";
 
@@ -143,6 +144,20 @@ async function postWithRetry(
       const body = await response.text();
 
       if (response.status === 401 || response.status === 403) {
+        // User-actionable: distinct from generic 5xx — token expired or wrong.
+        recordActivityEvent({
+          sessionId: context.sessionId,
+          source: "notifier",
+          kind: "notifier.auth_failed",
+          level: "error",
+          summary: `OpenClaw rejected auth token (HTTP ${response.status})`,
+          data: {
+            plugin: "notifier-openclaw",
+            status: response.status,
+            url,
+            fixHint: "ao setup openclaw",
+          },
+        });
         lastError = new Error(
           `OpenClaw rejected the auth token (HTTP ${response.status}).\n` +
             `  Check that hooks.token in your OpenClaw config matches the token configured for AO.\n` +
@@ -167,6 +182,19 @@ async function postWithRetry(
       lastError = err instanceof Error ? err : new Error(String(err));
 
       if (lastError.message.includes("ECONNREFUSED")) {
+        recordActivityEvent({
+          sessionId: context.sessionId,
+          source: "notifier",
+          kind: "notifier.unreachable",
+          level: "warn",
+          summary: `OpenClaw gateway unreachable at ${url}`,
+          data: {
+            plugin: "notifier-openclaw",
+            url,
+            errorMessage: lastError.message,
+            fixHint: "openclaw status",
+          },
+        });
         throw new Error(
           `Can't reach OpenClaw gateway at ${url}.\n` +
             `  Is OpenClaw running? Check: openclaw status\n` +

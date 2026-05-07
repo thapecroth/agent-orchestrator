@@ -7,6 +7,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
   CI_STATUS,
+  recordActivityEvent,
   type PluginModule,
   type SCM,
   type SCMWebhookEvent,
@@ -585,6 +586,20 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
             `getCISummary: PR state fallback also failed for MR !${pr.number}: ${(innerErr as Error).message}`,
           );
         }
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        recordActivityEvent({
+          source: "scm",
+          kind: "scm.ci_summary_failclosed",
+          level: "warn",
+          summary: `getCISummary failed-closed for MR !${pr.number}`,
+          data: {
+            plugin: "scm-gitlab",
+            prNumber: pr.number,
+            prOwner: pr.owner,
+            prRepo: pr.repo,
+            errorMessage,
+          },
+        });
         return "failing";
       }
       if (checks.length === 0) return "none";
@@ -642,6 +657,20 @@ function createGitLabSCM(config?: Record<string, unknown>): SCM {
         console.warn(
           `getReviews: discussions fetch failed for MR !${pr.number}: ${(err as Error).message}`,
         );
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        recordActivityEvent({
+          source: "scm",
+          kind: "scm.review_fetch_failed",
+          level: "warn",
+          summary: `getReviews discussions fetch failed for MR !${pr.number}`,
+          data: {
+            plugin: "scm-gitlab",
+            prNumber: pr.number,
+            prOwner: pr.owner,
+            prRepo: pr.repo,
+            errorMessage,
+          },
+        });
       }
 
       return reviews;

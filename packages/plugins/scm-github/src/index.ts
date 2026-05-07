@@ -11,6 +11,7 @@ import {
   CI_STATUS,
   execGhObserved,
   memoizeAsync,
+  recordActivityEvent,
   type PluginModule,
   type PreflightContext,
   type SCM,
@@ -815,7 +816,7 @@ function createGitHubSCM(): SCM {
       let checks: CICheck[];
       try {
         checks = await this.getCIChecks(pr);
-      } catch {
+      } catch (err) {
         // Before fail-closing, check if the PR is merged/closed —
         // GitHub may not return check data for those, and reporting
         // "failing" for a merged PR is wrong.
@@ -826,7 +827,22 @@ function createGitHubSCM(): SCM {
           // Can't determine state either; fall through to fail-closed.
         }
         // Fail closed for open PRs: report as failing rather than
-        // "none" (which getMergeability treats as passing).
+        // "none" (which getMergeability treats as passing). Emit so RCA
+        // can distinguish "really failing" from "we couldn't tell".
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        recordActivityEvent({
+          source: "scm",
+          kind: "scm.ci_summary_failclosed",
+          level: "warn",
+          summary: `getCISummary failed-closed for PR #${pr.number}`,
+          data: {
+            plugin: "scm-github",
+            prNumber: pr.number,
+            prOwner: pr.owner,
+            prRepo: pr.repo,
+            errorMessage,
+          },
+        });
         return "failing";
       }
       if (checks.length === 0) return "none";

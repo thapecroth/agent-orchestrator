@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { existsSync, rmSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { recordActivityEvent } from "@aoagents/ao-core";
 import type {
   PluginModule,
   Workspace,
@@ -104,7 +105,20 @@ export function create(config?: Record<string, unknown>): Workspace {
       try {
         await git(clonePath, "checkout", "-b", cfg.branch);
       } catch {
-        // Branch may exist on remote — try plain checkout
+        // Branch may exist on remote — likely concurrent session collision.
+        // Try plain checkout to attach to the existing branch.
+        recordActivityEvent({
+          projectId: cfg.projectId,
+          sessionId: cfg.sessionId,
+          source: "workspace",
+          kind: "workspace.branch_collision",
+          level: "warn",
+          summary: `branch "${cfg.branch}" already exists; falling back to checkout`,
+          data: {
+            plugin: "workspace-clone",
+            branch: cfg.branch,
+          },
+        });
         try {
           await git(clonePath, "checkout", cfg.branch);
         } catch (checkoutErr: unknown) {
@@ -148,10 +162,24 @@ export function create(config?: Record<string, unknown>): Workspace {
         try {
           branch = await git(clonePath, "branch", "--show-current");
         } catch (err: unknown) {
-          // Warn about corrupted clones instead of silently skipping
+          // Warn about corrupted clones instead of silently skipping.
+          // RCA: "session shows up on disk but isn't returned by list()".
           const msg = err instanceof Error ? err.message : String(err);
           // eslint-disable-next-line no-console -- expected diagnostic for corrupted clones
           console.warn(`[workspace-clone] Skipping "${entry.name}": not a valid git repo (${msg})`);
+          recordActivityEvent({
+            projectId,
+            sessionId: entry.name,
+            source: "workspace",
+            kind: "workspace.corrupt_clone_skipped",
+            level: "warn",
+            summary: `skipped corrupt clone "${entry.name}"`,
+            data: {
+              plugin: "workspace-clone",
+              clonePath,
+              errorMessage: msg,
+            },
+          });
           continue;
         }
 

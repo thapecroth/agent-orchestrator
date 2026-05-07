@@ -9,6 +9,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   execGhObserved,
+  recordActivityEvent,
   type BatchObserver,
   type CICheck,
   type CIStatus,
@@ -350,6 +351,10 @@ interface ErrorWithCause extends Error {
   cause?: unknown;
 }
 
+// Module-level guard so we only emit gh_unavailable once per process.
+// The error is system-wide (gh missing globally), not session-specific.
+let ghUnavailableEmitted = false;
+
 /**
  * Pre-flight check to verify gh CLI is available and authenticated.
  * This prevents silent failures during GraphQL batch queries.
@@ -357,13 +362,32 @@ interface ErrorWithCause extends Error {
 async function verifyGhCLI(): Promise<void> {
   try {
     await execFileAsync("gh", ["--version"], { timeout: 5000 });
-  } catch {
+  } catch (err) {
+    if (!ghUnavailableEmitted) {
+      ghUnavailableEmitted = true;
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      recordActivityEvent({
+        source: "scm",
+        kind: "scm.gh_unavailable",
+        level: "error",
+        summary: "gh CLI not available or not authenticated",
+        data: {
+          plugin: "scm-github",
+          errorMessage,
+        },
+      });
+    }
     const error = new Error(
       "gh CLI not available or not authenticated. GraphQL batch enrichment requires gh CLI to be installed and configured.",
     ) as ErrorWithCause;
     error.cause = "GH_CLI_UNAVAILABLE";
     throw error;
   }
+}
+
+/** Test-only: reset the once-per-process gh_unavailable guard. */
+export function _resetGhUnavailableEmittedForTesting(): void {
+  ghUnavailableEmitted = false;
 }
 
 /**
@@ -1126,6 +1150,22 @@ export async function enrichSessionsPRBatch(
             result.set(prKey, enrichment);
             // Update PR metadata cache for future ETag checks
             updatePRMetadataCache(prKey, enrichment, headSha);
+          } else {
+            // GraphQL returned a PR object but extractPREnrichment couldn't
+            // parse it (missing fields, schema drift). Distinct from the
+            // whole-batch failure D02 catches further down.
+            recordActivityEvent({
+              source: "scm",
+              kind: "scm.batch_enrich_pr_failed",
+              level: "warn",
+              summary: `batch enrich extraction failed for PR #${pr.number}`,
+              data: {
+                plugin: "scm-github",
+                prNumber: pr.number,
+                prOwner: pr.owner,
+                prRepo: pr.repo,
+              },
+            });
           }
         } else {
           // PR not found (deleted/closed/permission issue)
